@@ -1,13 +1,20 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
+  BUDGET_SAFETY_MARGIN_TOKENS,
   compactToFit,
+  completionBudgetFor,
+  DEFAULT_COMPLETION_CEILING_TOKENS,
+  DEFAULT_MAX_COMPLETION_TOKENS,
   effectiveInputBudget,
   hardCompactionThreshold,
   proactiveCompactionThreshold,
   sessionFileCompactionTarget,
   softCompactionThreshold,
 } from "./context-budget.js";
+import { registerUserModels } from "../models/registry.js";
+import { dlFreeModelEntry } from "../providers/directionally-local.js";
 import { estimatePromptTokens } from "./artifact-compaction.js";
 import type { ChatMessage } from "./messages.js";
 import type { SerializedArtifact, SessionState } from "./session-state.js";
@@ -106,5 +113,101 @@ describe("context budget: a local server's reported context", () => {
     assert.equal(effectiveInputBudget("served-model"), 32768 - 16384 - 2048);
     assert.notEqual(before, effectiveInputBudget("served-model"));
     resetLocalContextForTesting();
+  });
+});
+
+describe("completion budget: model-aware, ceiling-clamped", () => {
+  const DL_MODEL = "deepseek/deepseek-v4.1-flash-1017";
+
+  function withModels<T>(entries: Parameters<typeof registerUserModels>[0], fn: () => T): T {
+    registerUserModels(entries);
+    try {
+      return fn();
+    } finally {
+      registerUserModels([]);
+    }
+  }
+
+  it("resolves the free tier's budget against the documented ceiling (criterion 1)", () => {
+    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+      // min(65,536 declared, 32,768 ceiling, 1,048,576 - 8,192 headroom)
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true }), 32_768);
+      assert.equal(DEFAULT_COMPLETION_CEILING_TOKENS, 32_768);
+      // MR-22's raise to the declared limit: the ceiling is a parameter, not a hardcode.
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, ceiling: 65_536 }), 65_536);
+      // MR-23's allowance-dependence: a smaller remaining allowance lowers it.
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, ceiling: 20_000 }), 20_000);
+      // Off the free tier the declared limit is the ceiling.
+      assert.equal(completionBudgetFor(DL_MODEL), 65_536);
+    });
+  });
+
+  it("keeps the flat default for a non-thinking model or one with no declared output limit (criterion 4)", () => {
+    assert.equal(completionBudgetFor("unknown/model"), DEFAULT_MAX_COMPLETION_TOKENS);
+    withModels(
+      [
+        {
+          id: "test/non-thinking",
+          contextWindow: 1_000_000,
+          maxOutputTokens: 131_072,
+          pricing: { inputPerMtok: 0, outputPerMtok: 0 },
+          supports: { tools: true, reasoning: false, streaming: true },
+        },
+        {
+          id: "test/no-output-limit",
+          contextWindow: 1_000_000,
+          maxOutputTokens: 0,
+          pricing: { inputPerMtok: 0, outputPerMtok: 0 },
+          supports: { tools: true, reasoning: true, streaming: true },
+        },
+      ],
+      () => {
+        assert.equal(completionBudgetFor("test/non-thinking"), DEFAULT_MAX_COMPLETION_TOKENS);
+        assert.equal(completionBudgetFor("test/no-output-limit"), DEFAULT_MAX_COMPLETION_TOKENS);
+      },
+    );
+  });
+
+  it("lets an explicit maxCompletionTokens override the model-aware default and the ceiling (criterion 5)", () => {
+    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, maxCompletionTokens: 4_096 }), 4_096);
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, maxCompletionTokens: 100_000 }), 100_000);
+    });
+  });
+
+  it("clamps to the context-window headroom", () => {
+    withModels(
+      [
+        {
+          id: "test/small-window",
+          contextWindow: 40_000,
+          maxOutputTokens: 65_536,
+          pricing: { inputPerMtok: 0, outputPerMtok: 0 },
+          supports: { tools: true, reasoning: true, streaming: true },
+        },
+      ],
+      () => {
+        assert.equal(completionBudgetFor("test/small-window"), 40_000 - BUDGET_SAFETY_MARGIN_TOKENS);
+      },
+    );
+  });
+
+  it("moves the input budget and compaction thresholds with the completion budget", () => {
+    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+      const budget = 1_048_576 - 32_768 - BUDGET_SAFETY_MARGIN_TOKENS;
+      assert.equal(effectiveInputBudget(DL_MODEL, undefined, { freeTier: true }), budget);
+      assert.equal(softCompactionThreshold(DL_MODEL, { freeTier: true }), Math.floor(budget * 0.6));
+      assert.equal(hardCompactionThreshold(DL_MODEL, { freeTier: true }), Math.floor(budget * 0.85));
+    });
+  });
+
+  it("documents the ceiling in the maintainer's wording (criterion 7)", async () => {
+    const source = await readFile(new URL("./context-budget.ts", import.meta.url), "utf8");
+    // The comment wraps; compare the wording with its line breaks flattened.
+    const prose = source.replace(/\s*\*\s*/g, " ").replace(/\s+/g, " ");
+    assert.match(
+      prose,
+      /up to the model's maxOutputTokens, and on the free tier also limited by the remaining allowance/,
+    );
   });
 });

@@ -15,6 +15,13 @@ import {
  *  `input + max_completion_tokens` against the context window. */
 export const DEFAULT_MAX_COMPLETION_TOKENS = 16_384;
 
+/** The free tier's documented output ceiling (MR-21/MR-23): "up to the model's
+ *  maxOutputTokens, and on the free tier also limited by the remaining
+ *  allowance." The gateway clamps a request above it rather than rejecting it.
+ *  Today 32,768; MR-22 raises it to the declared 65,536 once the maintainer
+ *  confirms it live — update this constant then (the confirmation flow). */
+export const DEFAULT_COMPLETION_CEILING_TOKENS = 32_768;
+
 /** Headroom for estimator drift: prompt tokens are estimated from characters,
  *  which under-counts code- and JSON-heavy content. */
 export const BUDGET_SAFETY_MARGIN_TOKENS = 8_192;
@@ -39,14 +46,53 @@ export const HARD_COMPACTION_SHARE = 0.85;
 /** Recent turns to keep raw, tried in order until the history fits. */
 const KEEP_TURNS_LADDER = [4, 2, 1] as const;
 
+export interface CompletionBudgetOpts {
+  /** Explicit override from the caller (the opts plumbing). Wins over the
+   *  model-aware default and the ceiling. */
+  maxCompletionTokens?: number;
+  /** The request goes to the free tier, whose gateway applies the ceiling. */
+  freeTier?: boolean;
+  /** The documented ceiling; defaults to {@link DEFAULT_COMPLETION_CEILING_TOKENS}.
+   *  Parameterized so a cap change (MR-22) and the tests don't hardcode it. */
+  ceiling?: number;
+}
+
+/**
+ * The completion budget to request for `model`: the model's declared
+ * maxOutputTokens, the documented ceiling (free tier only) and the
+ * context-window headroom, whichever is smallest. A model that declares no
+ * output limit, or doesn't reason, keeps {@link DEFAULT_MAX_COMPLETION_TOKENS}
+ * — thinking is what exhausts the budget.
+ */
+export function completionBudgetFor(model: string, opts: CompletionBudgetOpts = {}): number {
+  if (opts.maxCompletionTokens !== undefined) return opts.maxCompletionTokens;
+  const entry = getModelOrInfer(model);
+  const declared = entry.maxOutputTokens;
+  if (entry.supports.reasoning !== true || !declared || declared <= 0) return DEFAULT_MAX_COMPLETION_TOKENS;
+  const ceiling = opts.freeTier ? (opts.ceiling ?? DEFAULT_COMPLETION_CEILING_TOKENS) : declared;
+  const headroom = Math.max(1, entry.contextWindow - BUDGET_SAFETY_MARGIN_TOKENS);
+  return Math.max(1, Math.min(declared, ceiling, headroom));
+}
+
+export interface InputBudgetOpts {
+  /** The request goes to the free tier, whose gateway applies the completion ceiling. */
+  freeTier?: boolean;
+  /** The documented completion ceiling; see {@link DEFAULT_COMPLETION_CEILING_TOKENS}. */
+  ceiling?: number;
+}
+
 /** Largest prompt the model accepts: context window minus the completion
  *  budget and a safety margin. Shared by request preflight and compaction.
  *  When a local server reported the context it serves the model with
  *  (models/local-context.ts), that context counts, the completion budget is
  *  capped the way the client caps `max_tokens`, and the margin shrinks with
  *  the window (8k of a 32k window would be a quarter of it). */
-export function effectiveInputBudget(model: string, maxCompletionTokens?: number): number {
-  const requested = maxCompletionTokens ?? DEFAULT_MAX_COMPLETION_TOKENS;
+export function effectiveInputBudget(model: string, maxCompletionTokens?: number, opts: InputBudgetOpts = {}): number {
+  const requested = completionBudgetFor(model, {
+    maxCompletionTokens,
+    freeTier: opts.freeTier,
+    ceiling: opts.ceiling,
+  });
   const served = servedContextLength(model);
   if (served) {
     const completion = capOutputTokens(requested, served, model);
@@ -57,7 +103,7 @@ export function effectiveInputBudget(model: string, maxCompletionTokens?: number
   return Math.max(1, contextWindow - requested - BUDGET_SAFETY_MARGIN_TOKENS);
 }
 
-export interface CompactionThresholdOpts {
+export interface CompactionThresholdOpts extends InputBudgetOpts {
   maxCompletionTokens?: number;
   /** Optional absolute token cap (cost control). Off by default. */
   absoluteCapTokens?: number;
@@ -65,14 +111,14 @@ export interface CompactionThresholdOpts {
 
 /** Estimated-token level at which hosts elide stale tool output. */
 export function softCompactionThreshold(model: string, opts: CompactionThresholdOpts = {}): number {
-  const budget = effectiveInputBudget(model, opts.maxCompletionTokens);
+  const budget = effectiveInputBudget(model, opts.maxCompletionTokens, opts);
   const soft = Math.floor(budget * SOFT_COMPACTION_SHARE);
   return opts.absoluteCapTokens ? Math.min(soft, opts.absoluteCapTokens) : soft;
 }
 
 /** Estimated-token level above which hosts summarize instead of only eliding. */
 export function hardCompactionThreshold(model: string, opts: CompactionThresholdOpts = {}): number {
-  const budget = effectiveInputBudget(model, opts.maxCompletionTokens);
+  const budget = effectiveInputBudget(model, opts.maxCompletionTokens, opts);
   const hard = Math.floor(budget * HARD_COMPACTION_SHARE);
   return opts.absoluteCapTokens ? Math.min(hard, opts.absoluteCapTokens) : hard;
 }

@@ -22,7 +22,7 @@ import { ANTHROPIC_VERSION, anthropicHeaders, parseAnthropicStream, toAnthropicR
 import { copilotRequestHeaders } from "../providers/copilot.js";
 import { chatgptAccessToken, chatgptSessionHeaders, NON_RETRYABLE_SHARING_CODES } from "../providers/chatgpt.js";
 import { modelRetryCount, modelRetryDelay, modelRetryLine, parseRetryAfter, retryAfterOf, shouldRetryModelCall } from "./model-retry.js";
-import { describeDlError, DL_BUSY_RETRY_AFTER_MS, dlFallbackNotice, dlRetryable, dlAccessToken, DlError, noteDlQuotaExceeded, parseDlError, quotaNoticeFromHeaders } from "../providers/directionally-local.js";
+import { describeDlError, DL_BUSY_RETRY_AFTER_MS, DL_PROVIDER_ID, dlFallbackNotice, dlRetryable, dlAccessToken, DlError, noteDlQuotaExceeded, parseDlError, quotaNoticeFromHeaders } from "../providers/directionally-local.js";
 import { toVertexAnthropicBody, vertexAccessToken, vertexTarget } from "../providers/vertex.js";
 import { bedrockAuth, bedrockHeaders, converseUrl, parseConverseStream, toConverseRequest } from "../providers/bedrock.js";
 
@@ -35,9 +35,10 @@ import { openRouterHeaders, openRouterUrl, OPENROUTER_KEYS_URL } from "../models
 import { requestyHeaders, requestyUrl, REQUESTY_KEYS_URL } from "../models/requesty.js";
 import { resolveCustomEndpoint, customChatCompletionsUrl, type CustomEndpoint } from "./custom-endpoint.js";
 import type { LlmAuth } from "./llm-auth.js";
+import { providerIdOf } from "./llm-auth.js";
 import { fitOutputTokens, localContextLength, localContextMessage, localProviderOf, servedPromptLimit } from "../models/local-context.js";
 import { approxTokens, estimatePromptTokens } from "./artifact-compaction.js";
-import { ContextBudgetError } from "./context-budget.js";
+import { ContextBudgetError, completionBudgetFor } from "./context-budget.js";
 
 export type ModelEvent =
   | { type: "response_meta"; meta: ResponseMeta }
@@ -144,7 +145,14 @@ export async function* runKimi(opts: RunKimiOpts): AsyncGenerator<ModelEvent, vo
   const supportsReasoning = entry.supports.reasoning === true;
 
   const hasTools = !!opts.tools && opts.tools.length > 0;
-  let maxTokens = opts.maxCompletionTokens ?? 16384;
+  // The completion budget is model-aware (context-budget.ts): the model's
+  // declared output limit, the free tier's documented ceiling and the
+  // context-window headroom, whichever is smallest. An explicit
+  // `maxCompletionTokens` still wins.
+  let maxTokens = completionBudgetFor(opts.model, {
+    maxCompletionTokens: opts.maxCompletionTokens,
+    freeTier: providerIdOf(opts) === DL_PROVIDER_ID,
+  });
   // Request-shape quirks of the provider this request goes to (presets.ts).
   const preset = getPreset(
     customEndpoint ? (customEndpoint.providerId ?? "custom") : requesty ? "requesty" : "openrouter",
