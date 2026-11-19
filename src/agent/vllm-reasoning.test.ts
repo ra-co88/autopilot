@@ -135,16 +135,24 @@ describe("vLLM thinking models", () => {
     assert.deepStrictEqual(t.warnings, []);
   });
 
-  it("a reply that is only reasoning (out of tokens) says so plainly, and doesn't crash or retry", async () => {
-    vllm.replies.push([
-      delta({ role: "assistant", content: "<think>Let me think about this carefully" }),
-      delta({ content: " and then some more" }, "length"),
-    ]);
+  it("a reply that is only reasoning (out of tokens) is retried once, then says so plainly", async () => {
+    vllm.replies.push(
+      [
+        delta({ role: "assistant", content: "<think>Let me think about this carefully" }),
+        delta({ content: " and then some more" }, "length"),
+      ],
+      [delta({ role: "assistant", content: "<think>Still thinking" }, "length")],
+    );
     const t = await turn();
     assert.strictEqual(t.text, "");
     assert.match(t.reasoning, /Let me think about this carefully and then some more/);
-    assert.deepStrictEqual(t.warnings, [reasoningOnlyLine("length")]);
-    assert.strictEqual(t.warnings[0], "The model only thought and gave no answer: it ran out of tokens while thinking. Ask again, or ask for less at once.");
+    // MR-24: the cut reply is retried once with the budget raised to the
+    // model-aware ceiling (16,384 for a model with no declared output limit).
+    assert.deepStrictEqual(t.warnings, [reasoningOnlyLine("length", { maxTokens: 16_384 })]);
+    assert.strictEqual(
+      t.warnings[0],
+      "The model only thought and gave no answer: it ran out of tokens while thinking. It was retried once with a 16,384-token budget. Ask again, or ask for less at once.",
+    );
     assert.deepStrictEqual(t.retries, []);
     assert.strictEqual(t.assistants[0]!.content, null);
 

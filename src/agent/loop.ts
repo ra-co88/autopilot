@@ -36,7 +36,7 @@ import { getModelOrInfer } from "../models/registry.js";
 import { modelProfileFor } from "../models/profile.js";
 import { toolOutputCapForContextWindow } from "../tools/reducer.js";
 import { createPermissionGate } from "./permission-gate.js";
-import { compactToFit, ContextBudgetError, effectiveInputBudget, type CompactionTarget } from "./context-budget.js";
+import { compactToFit, completionBudgetFor, ContextBudgetError, effectiveInputBudget, type CompactionTarget } from "./context-budget.js";
 import { withTurnDirective } from "./turn-directive.js";
 import { buildPlanReminder, withPlanReminder } from "./plan-reminder.js";
 import { classifyVerification } from "../trace/verification.js";
@@ -905,6 +905,8 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
   try {
   // (The body of this loop predates the try/catch and keeps its indentation;
   //  the wrapper exists only to label abnormal exits in logTurnOutcome.)
+  // MR-24: at most one reasoning-only length escalation per turn.
+  let escalatedThisTurn = false;
   while (true) {
     // Budget enforcement: before starting a new turn, if we've already hit the
     // limit, run one final synthesis turn and then signal budget exhaustion.
@@ -1014,6 +1016,8 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
     let content = "";
     let reasoning = "";
     let finishReason: string | null = null;
+    /** Set when this iteration's reply was retried by the MR-24 escalation. */
+    let escalationUsed: ReasoningEscalation | undefined;
     let responseMeta: ResponseMeta | undefined;
     /** This response's own usage (lastUsage carries over from earlier responses). */
     let responseUsage: Usage | null = null;
@@ -1078,7 +1082,10 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
     const toolTokens = servedContext ? approxTokens(JSON.stringify(toolDefs ?? []).length) : 0;
     // The API rejects when `input + max_completion_tokens > ctxWindow`, so the
     // budget comes from those exact terms plus a margin for estimator drift.
-    const maxPromptTokens = Math.max(1, effectiveInputBudget(opts.model, opts.maxCompletionTokens) - toolTokens);
+    const maxPromptTokens = Math.max(
+      1,
+      effectiveInputBudget(opts.model, opts.maxCompletionTokens, { freeTier: opts.providerId === DL_PROVIDER_ID }) - toolTokens,
+    );
     if (promptTokens > maxPromptTokens && opts.compaction) {
       // One bounded pass: archive older complete turns (raw content stays in
       // the artifact store), keep the active turn, then re-estimate.
@@ -1151,7 +1158,11 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
     const maxModelRetries = modelRetryCount(opts.modelRetries);
     const usageBeforeCall: Usage | null = lastUsage;
     const toolsUsedBeforeCall = tr.toolsUsed.length;
-    for (let retries = 0; ; retries++) {
+    // The escalation changes what the retry asks for; the transient-retry
+    // counter stays separate (an escalation is not a host failure).
+    let attemptMaxTokens = opts.maxCompletionTokens;
+    let attemptEffort = opts.reasoningEffort;
+    for (let retries = 0; ; ) {
       // Generate the id here so the cost-debug rows can join to the request
       // log's TTFT/stream events (keyed by this requestId), retries included.
       const requestId = crypto.randomUUID();
@@ -1167,8 +1178,8 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
           tools: toolDefs,
           signal: opts.signal,
           temperature: opts.temperature,
-          maxCompletionTokens: opts.maxCompletionTokens,
-          reasoningEffort: opts.reasoningEffort,
+          maxCompletionTokens: attemptMaxTokens,
+          reasoningEffort: attemptEffort,
           sessionId: opts.sessionId,
           idleTimeoutMs: opts.idleTimeoutMs ?? 60_000,
           postFirstByteIdleTimeoutMs: opts.postFirstByteIdleTimeoutMs,
@@ -1230,6 +1241,52 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
               break;
           }
         }
+        // MR-24: a reply that is only reasoning and was cut at `length` gets
+        // one retry with less thinking — a lower reasoning effort where the
+        // provider has the knob, else the budget raised to the ceiling.
+        if (
+          !escalatedThisTurn &&
+          finishReason === "length" &&
+          toolCalls.length === 0 &&
+          !content.trim() &&
+          reasoning.trim()
+        ) {
+          const entry = getModelOrInfer(opts.model);
+          const escalation = reasoningEscalation(opts.model, {
+            reasoningEffort: attemptEffort,
+            maxCompletionTokens: attemptMaxTokens,
+            freeTier: opts.providerId === DL_PROVIDER_ID,
+            effortKnob:
+              providerPresetOf(llmAuthOf(opts)).compat.reasoningEffort &&
+              entry.supports.reasoning === true &&
+              entry.reasoningEfforts?.length !== 0,
+          });
+          escalatedThisTurn = true;
+          escalationUsed = {
+            ...(escalation.reasoningEffort ? { effort: escalation.reasoningEffort } : {}),
+            ...(escalation.maxCompletionTokens ? { maxTokens: escalation.maxCompletionTokens } : {}),
+          };
+          logger.info("turn:reasoning_escalation", {
+            sessionId: opts.sessionId,
+            effort: escalation.reasoningEffort,
+            maxTokens: escalation.maxCompletionTokens,
+          });
+          // Nothing from the cut attempt reaches history: the assistant
+          // message is built only after the retry.
+          content = "";
+          reasoning = "";
+          finishReason = null;
+          reasoningDetails = [];
+          toolCalls.length = 0;
+          tr.toolsUsed.length = toolsUsedBeforeCall;
+          tr.partialText = "";
+          responseMeta = undefined;
+          responseUsage = null;
+          lastUsage = usageBeforeCall;
+          attemptMaxTokens = escalation.maxCompletionTokens ?? attemptMaxTokens;
+          attemptEffort = escalation.reasoningEffort ?? attemptEffort;
+          continue;
+        }
         break;
       } catch (err) {
         if (opts.signal.aborted) throw err;
@@ -1266,6 +1323,7 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
         }
         await (opts.retrySleep ?? sleepUnlessAborted)(delayMs, opts.signal);
         if (opts.signal.aborted) throw new DOMException("aborted", "AbortError");
+        retries++;
       }
     }
 
@@ -1342,7 +1400,7 @@ async function runAgentTurnInner(opts: AgentTurnOpts, tr: TurnTrace): Promise<vo
       // A thinking model (e.g. served by vLLM) that only reasoned: not an empty answer to
       // retry, but one to explain. The reasoning stays visible like any other.
       logger.info("turn:reasoning_only", { sessionId: opts.sessionId, finishReason });
-      opts.callbacks.onWarning?.(reasoningOnlyLine(finishReason));
+      opts.callbacks.onWarning?.(reasoningOnlyLine(finishReason, escalationUsed));
     }
 
     if (toolCalls.length === 0) {
@@ -2251,9 +2309,68 @@ function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** The effort levels a model may declare, lowest first. */
+const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** The lowest effort the model accepts that is below `current`, or null when
+ *  the model has no lower level (the escalation then raises the budget). */
+function lowerReasoningEffort(
+  current: "low" | "medium" | "high" | undefined,
+  supported: string[] | undefined,
+): "low" | "medium" | "high" | null {
+  const levels = (supported?.length ? supported : ["low", "medium", "high"]).filter((l) =>
+    (EFFORT_LEVELS as readonly string[]).includes(l),
+  );
+  const rank = (l: string) => EFFORT_LEVELS.indexOf(l as (typeof EFFORT_LEVELS)[number]);
+  const currentRank = current ? rank(current) : rank("high");
+  const lower = levels.filter((l) => rank(l) < currentRank).sort((a, b) => rank(b) - rank(a));
+  const pick = lower[0];
+  if (!pick) return null;
+  // RunKimiOpts carries the three classic levels; the client maps them onto
+  // the model's own list (effortFor).
+  const mapped = pick === "medium" || pick === "high" ? pick : "low";
+  return current && rank(mapped) >= rank(current) ? null : mapped;
+}
+
+/** The one-shot escalation for a reasoning-only reply cut at `length` (MR-24):
+ *  a lower reasoning effort where the provider has the knob, else the budget
+ *  raised to the model-aware ceiling. */
+function reasoningEscalation(
+  model: string,
+  opts: {
+    reasoningEffort?: "low" | "medium" | "high";
+    maxCompletionTokens?: number;
+    freeTier: boolean;
+    effortKnob: boolean;
+  },
+): { reasoningEffort?: "low" | "medium" | "high"; maxCompletionTokens?: number } {
+  if (opts.effortKnob) {
+    const lower = lowerReasoningEffort(opts.reasoningEffort, getModelOrInfer(model).reasoningEfforts);
+    if (lower) return { reasoningEffort: lower };
+  }
+  return {
+    maxCompletionTokens: opts.maxCompletionTokens ?? completionBudgetFor(model, { freeTier: opts.freeTier }),
+  };
+}
+
+/** What the one-shot escalation tried, for the surfaced message (criterion 6). */
+export interface ReasoningEscalation {
+  /** The lower effort the retry used, when the provider has the knob. */
+  effort?: string;
+  /** The budget the retry requested. */
+  maxTokens?: number;
+}
+
 /** Said when a reply was all reasoning: no text and no tool calls. */
-export function reasoningOnlyLine(finishReason: string | null): string {
-  return finishReason === "length"
-    ? "The model only thought and gave no answer: it ran out of tokens while thinking. Ask again, or ask for less at once."
-    : "The model only thought and gave no answer. Ask again.";
+export function reasoningOnlyLine(finishReason: string | null, escalation?: ReasoningEscalation): string {
+  if (finishReason !== "length") return "The model only thought and gave no answer. Ask again.";
+  const tried = escalation
+    ? ` It was retried once with ${[
+        escalation.effort ? `a lower reasoning effort (${escalation.effort})` : null,
+        escalation.maxTokens ? `a ${escalation.maxTokens.toLocaleString("en-US")}-token budget` : null,
+      ]
+        .filter(Boolean)
+        .join(" and ")}.`
+    : "";
+  return `The model only thought and gave no answer: it ran out of tokens while thinking.${tried} Ask again, or ask for less at once.`;
 }
