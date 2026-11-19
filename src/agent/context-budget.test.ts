@@ -13,8 +13,8 @@ import {
   sessionFileCompactionTarget,
   softCompactionThreshold,
 } from "./context-budget.js";
-import { registerUserModels } from "../models/registry.js";
-import { dlFreeModelEntry } from "../providers/directionally-local.js";
+import { registerProviderModels, registerUserModels } from "../models/registry.js";
+import { registerDlModels } from "../providers/directionally-local.js";
 import { estimatePromptTokens } from "./artifact-compaction.js";
 import type { ChatMessage } from "./messages.js";
 import type { SerializedArtifact, SessionState } from "./session-state.js";
@@ -119,6 +119,17 @@ describe("context budget: a local server's reported context", () => {
 describe("completion budget: model-aware, ceiling-clamped", () => {
   const DL_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 
+  function withDlModels<T>(fn: () => T): T {
+    registerDlModels();
+    try {
+      return fn();
+    } finally {
+      registerProviderModels("directionally-local", []);
+    }
+  }
+
+  /** Synthetic entries for the resolution logic; the DL tests use the
+   *  production registration above, not a test-installed copy. */
   function withModels<T>(entries: Parameters<typeof registerUserModels>[0], fn: () => T): T {
     registerUserModels(entries);
     try {
@@ -129,7 +140,7 @@ describe("completion budget: model-aware, ceiling-clamped", () => {
   }
 
   it("resolves the free tier's budget against the documented ceiling (criterion 1)", () => {
-    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+    withDlModels(() => {
       // min(65,536 declared, 32,768 ceiling, 1,048,576 - 8,192 headroom)
       assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true }), 32_768);
       assert.equal(DEFAULT_COMPLETION_CEILING_TOKENS, 32_768);
@@ -169,7 +180,7 @@ describe("completion budget: model-aware, ceiling-clamped", () => {
   });
 
   it("lets an explicit maxCompletionTokens override the model-aware default and the ceiling (criterion 5)", () => {
-    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+    withDlModels(() => {
       assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, maxCompletionTokens: 4_096 }), 4_096);
       assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true, maxCompletionTokens: 100_000 }), 100_000);
     });
@@ -193,12 +204,40 @@ describe("completion budget: model-aware, ceiling-clamped", () => {
   });
 
   it("moves the input budget and compaction thresholds with the completion budget", () => {
-    withModels([dlFreeModelEntry(DL_MODEL)], () => {
+    withDlModels(() => {
       const budget = 1_048_576 - 32_768 - BUDGET_SAFETY_MARGIN_TOKENS;
       assert.equal(effectiveInputBudget(DL_MODEL, undefined, { freeTier: true }), budget);
       assert.equal(softCompactionThreshold(DL_MODEL, { freeTier: true }), Math.floor(budget * 0.6));
       assert.equal(hardCompactionThreshold(DL_MODEL, { freeTier: true }), Math.floor(budget * 0.85));
     });
+  });
+
+  it("registers the DL models through the production catalog init (the probe matrix)", async () => {
+    const { ensureCatalogForProvider } = await import("../models/catalog.js");
+    const { llmAuthFromConfig } = await import("../agent/llm-auth.js");
+    const { getModelOrInfer } = await import("../models/registry.js");
+    try {
+      await ensureCatalogForProvider(
+        llmAuthFromConfig({
+          provider: "directionally-local",
+          providers: { "directionally-local": { apiKey: "at" } },
+        } as never),
+      );
+      // The real registry answers with the provider's declared metadata, not the
+      // unknown-model fallback (128k window, 16k output, reasoning: false).
+      const entry = getModelOrInfer(DL_MODEL);
+      assert.equal(entry.contextWindow, 1_048_576);
+      assert.equal(entry.maxOutputTokens, 65_536);
+      assert.equal(entry.supports.reasoning, true);
+      // The budget and the compaction thresholds read that metadata.
+      assert.equal(completionBudgetFor(DL_MODEL, { freeTier: true }), 32_768);
+      assert.equal(
+        effectiveInputBudget(DL_MODEL, undefined, { freeTier: true }),
+        1_048_576 - 32_768 - BUDGET_SAFETY_MARGIN_TOKENS,
+      );
+    } finally {
+      registerProviderModels("directionally-local", []);
+    }
   });
 
   it("documents the ceiling in the maintainer's wording (criterion 7)", async () => {

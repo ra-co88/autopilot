@@ -23,6 +23,14 @@ export async function ensureCatalogForProvider(auth: LlmAuth, fetchImpl: typeof 
       await ensureRequestyCatalog({ fetchImpl });
       return;
     }
+    case "directionally-local": {
+      // The free tier's models are declared in the provider, not fetched: register
+      // them so every metadata consumer (budget, compaction, capabilities) reads
+      // the real 1M window and 65k output instead of the unknown-model fallback.
+      const { registerDlModels } = await import("../providers/directionally-local.js");
+      registerDlModels();
+      return;
+    }
     default: {
       const { ensureProviderCatalog } = await import("./provider-catalog.js");
       await ensureProviderCatalog(id, auth.customEndpoint ?? {}, fetchImpl);

@@ -14,8 +14,8 @@ import { reasoningOnlyLine, runAgentTurn, type AgentTurnOpts } from "./loop.js";
 import type { LlmAuth } from "./llm-auth.js";
 import type { ChatMessage } from "./messages.js";
 import type { ModelEntry } from "../models/registry.js";
-import { registerUserModels } from "../models/registry.js";
-import { dlFreeModelEntry } from "../providers/directionally-local.js";
+import { registerProviderModels, registerUserModels } from "../models/registry.js";
+import { registerDlModels } from "../providers/directionally-local.js";
 import type { ToolExecutor } from "../tools/executor.js";
 
 const DL_MODEL = "deepseek/deepseek-v4.1-flash-1017";
@@ -102,6 +102,7 @@ describe("thinking completion budget: the one-shot escalation", () => {
   after(() => server.close());
   afterEach(() => {
     registerUserModels([]);
+    registerProviderModels("directionally-local", []);
     server.replies.length = 0;
     server.bodies.length = 0;
   });
@@ -144,7 +145,7 @@ describe("thinking completion budget: the one-shot escalation", () => {
   });
 
   it("retries once with the budget raised to the ceiling where there is no effort knob (criterion 2)", async () => {
-    registerUserModels([dlFreeModelEntry(DL_MODEL)]);
+    registerDlModels();
     server.replies.push(reasoningOnlyLength(), [delta({ content: "Done." }, "stop")]);
     const t = await turn(dlAuth(server.url), DL_MODEL);
     assert.equal(server.bodies.length, 2, "one retry");
@@ -155,7 +156,7 @@ describe("thinking completion budget: the one-shot escalation", () => {
   });
 
   it("escalates at most once and surfaces the message noting what was tried (criteria 3, 6)", async () => {
-    registerUserModels([dlFreeModelEntry(DL_MODEL)]);
+    registerDlModels();
     server.replies.push(reasoningOnlyLength(), reasoningOnlyLength(), reasoningOnlyLength());
     const t = await turn(dlAuth(server.url), DL_MODEL);
     assert.equal(server.bodies.length, 2, "a second length failure surfaces, no loop");
@@ -166,7 +167,7 @@ describe("thinking completion budget: the one-shot escalation", () => {
   });
 
   it("leaves a reasoning-only reply that was not cut at length alone", async () => {
-    registerUserModels([dlFreeModelEntry(DL_MODEL)]);
+    registerDlModels();
     server.replies.push([delta({ role: "assistant", reasoning_content: "Hmm." }, "stop")]);
     const t = await turn(dlAuth(server.url), DL_MODEL);
     assert.equal(server.bodies.length, 1, "no escalation");

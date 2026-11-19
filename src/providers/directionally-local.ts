@@ -22,7 +22,7 @@ import { readFile } from "node:fs/promises";
 import { configPath, patchPersistedConfig, setSessionModelFallback, type AutopilotConfig } from "../config.js";
 import { getUserAgent } from "../util/version.js";
 import type { ProviderSettings } from "./resolve.js";
-import type { ModelEntry } from "../models/registry.js";
+import { registerProviderModels, type ModelEntry } from "../models/registry.js";
 import { DL_FREE_DEFAULT_MODEL, dlOrigin } from "./dl-endpoint.js";
 import { launchedByDl, type EnvLike } from "../util/env.js";
 
@@ -102,6 +102,14 @@ export function dlFreeModelEntry(id: string = DL_FREE_MODEL): ModelEntry {
 /** Every free model as a catalog entry, for the picker and /model list. */
 export function dlFreeModelEntries(): ModelEntry[] {
   return DL_FREE_MODELS.map((model) => dlFreeModelEntry(model.id));
+}
+
+/** Register the free tier's models with the registry — the metadata every
+ *  budget, compaction and capability consumer reads. The startup catalog
+ *  loader calls this (models/catalog.ts); tests call it to prove the
+ *  production wiring instead of installing entries themselves. */
+export function registerDlModels(): void {
+  registerProviderModels(DL_PROVIDER_ID, dlFreeModelEntries());
 }
 
 /** Shown on the sign-in screen: what is collected in exchange for free tokens. */
