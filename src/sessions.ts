@@ -86,10 +86,25 @@ export function generateSessionTitle(firstPrompt: string, intent: string): strin
   return prefix ? `${prefix} ${words}` : words;
 }
 
+/**
+ * OpenAI's `prompt_cache_key` limit. Gateways that map the `X-Session-ID`
+ * header into that field reject a longer key ("string too long. Expected max
+ * 64"), so the session id — which is also a file name — stays within it.
+ */
+export const SESSION_ID_MAX_CHARS = 64;
+/** The `<timestamp>_<slug>` separator. */
+const SESSION_ID_SEPARATOR = "_";
+
 export function makeSessionId(firstPrompt: string): string {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const slug = sanitize(firstPrompt) || "session";
-  return `${ts}_${slug}`;
+  // Derive the slug budget from the parts (64 − ts − separator) rather than
+  // hardcoding 39: a longer timestamp format then shortens the slug instead of
+  // pushing the id past the limit. The slice is a plain prefix of the
+  // already-sanitized slug, so no new characters reach the file name, and the
+  // timestamp prefix keeps ids unique.
+  const slugMax = Math.max(0, SESSION_ID_MAX_CHARS - ts.length - SESSION_ID_SEPARATOR.length);
+  const slug = (sanitize(firstPrompt) || "session").slice(0, slugMax);
+  return `${ts}${SESSION_ID_SEPARATOR}${slug}`;
 }
 
 /** Session files hold conversation content: owner-only, like config.json. */
